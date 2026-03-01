@@ -1,214 +1,196 @@
-
-#include <LiquidCrystal.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 #include <EEPROM.h>
 
-// ---------- Config ----------
-#define MAX_VOTERS  10
-const uint8_t NUM_VOTERS = 9;
+// ---------------- LCD ----------------
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// LCD pins (RS, E, D4, D5, D6, D7)
-LiquidCrystal lcd(7, 6, 5, 4, 3, 2);
+// ---------------- Buttons ----------------
+#define BTN_A A0
+#define BTN_B A1
+#define BTN_C A2
+#define BTN_N A3
 
-// Buttons
-const uint8_t BTN_A = A0;
-const uint8_t BTN_B = A1;
-const uint8_t BTN_C = A2;
-const uint8_t BTN_N = A3;
-
-// ---------- LED + BUZZER (ADDED) ----------
+// ---------------- LEDs ----------------
 #define LED_A 8
 #define LED_B 9
 #define LED_C 10
 #define LED_N 11
+
+// ---------------- Buzzer ----------------
 #define BUZZER 12
-// ---------------------------------------
 
-// Debounce
-const unsigned long DEBOUNCE_MS = 50;
-const unsigned long VOTE_WINDOW_MS = 20000UL;
+// ---------------- VOTER DATABASE ----------------
+#define NUM_VOTERS 20
 
-// EEPROM layout
-const int EEPROM_MAGIC_ADDR = 0;
-const uint8_t EEPROM_MAGIC = 0x5A;
-const int EEPROM_VOTED_START = 1;
-const int EEPROM_COUNTS_START = EEPROM_VOTED_START + MAX_VOTERS;
+const char* voterID[NUM_VOTERS] = {
+  "VOTER015","VOTER014","VOTER013","VOTER012","VOTER011","VOTER010","VOTER009","VOTER008","VOTER007","VOTER006","VOTER005","VOTER004","VOTER003","VOTER002","VOTER001"
+};
 
-// Demo database
-const char *voterID[NUM_VOTERS]   = {"1234","5678","9012","3344","4455","6677","5555","2345","3452"};
-const char *voterName[NUM_VOTERS] = {"GOKUL","RAJ","ARUN","VARUN","THARUN","VINOTH","KISHORE","BALA","KAVI"};
+const char* voterName[NUM_VOTERS] = {
+  "votername15","votername14","votername13","votername12","votername11","votername10","votername09","votername08","votername07","votername06","votername05","votername04","votername03","votername02","votername01"
+};
 
-// Runtime variables
-bool votedFlags[MAX_VOTERS];
-int countA = 0, countB = 0, countC = 0, countN = 0;
+// ---------------- EEPROM LAYOUT ----------------
+#define EEPROM_MAGIC 0x5A
+#define EEPROM_MAGIC_ADDR 0
+#define EEPROM_VOTED_START 1   // 1 + voterIndex
 
-bool voting = false;
-int voterIndex = -1;
-unsigned long voteStartMs = 0;
-bool voteTaken = false;
+// ---------------- STATE ----------------
+int activeVoter = -1;
+bool votingEnabled = false;
 
-// Button debounce struct
-struct BtnState {
-  uint8_t pin;
-  bool lastState;
-  unsigned long lastChangeMs;
-} btnA, btnB, btnC, btnN;
+// ---------------- VOTE COUNTS (NEW) ----------------
+int countA = 0;
+int countB = 0;
+int countC = 0;
+int countN = 0;
 
-// ---------------- BUTTON SETUP ----------------
-void setupButtons() {
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(9600);
+
   pinMode(BTN_A, INPUT_PULLUP);
   pinMode(BTN_B, INPUT_PULLUP);
   pinMode(BTN_C, INPUT_PULLUP);
   pinMode(BTN_N, INPUT_PULLUP);
 
-  btnA = { BTN_A, digitalRead(BTN_A), 0 };
-  btnB = { BTN_B, digitalRead(BTN_B), 0 };
-  btnC = { BTN_C, digitalRead(BTN_C), 0 };
-  btnN = { BTN_N, digitalRead(BTN_N), 0 };
-}
-
-void updateButton(BtnState &b) {
-  bool cur = digitalRead(b.pin);
-  if (cur != b.lastState) {
-    if (millis() - b.lastChangeMs > DEBOUNCE_MS) {
-      b.lastChangeMs = millis();
-      b.lastState = cur;
-    }
-  }
-}
-
-// ---------------- EEPROM ----------------
-void eepromSaveAll() {
-  EEPROM.update(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
-  for (int i = 0; i < MAX_VOTERS; i++)
-    EEPROM.update(EEPROM_VOTED_START + i, votedFlags[i] ? 1 : 0);
-
-  int addr = EEPROM_COUNTS_START;
-  EEPROM.put(addr, countA); addr += sizeof(countA);
-  EEPROM.put(addr, countB); addr += sizeof(countB);
-  EEPROM.put(addr, countC); addr += sizeof(countC);
-  EEPROM.put(addr, countN);
-}
-
-void eepromLoadAll() {
-  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC) {
-    for (int i = 0; i < MAX_VOTERS; i++) votedFlags[i] = false;
-    countA = countB = countC = countN = 0;
-    eepromSaveAll();
-    return;
-  }
-  for (int i = 0; i < MAX_VOTERS; i++)
-    votedFlags[i] = EEPROM.read(EEPROM_VOTED_START + i);
-
-  int addr = EEPROM_COUNTS_START;
-  EEPROM.get(addr, countA); addr += sizeof(countA);
-  EEPROM.get(addr, countB); addr += sizeof(countB);
-  EEPROM.get(addr, countC); addr += sizeof(countC);
-  EEPROM.get(addr, countN);
-}
-
-// ---------------- HELPERS ----------------
-void showLCD(const char *l1, const char *l2 = "") {
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print(l1);
-  lcd.setCursor(0,1);
-  lcd.print(l2);
-}
-
-int findVoterIndex(const char* vid, const char* name) {
-  for (int i = 0; i < NUM_VOTERS; i++)
-    if (strcmp(voterID[i], vid) == 0 && strcmp(voterName[i], name) == 0)
-      return i;
-  return -1;
-}
-
-// ---------------- VOTE FLOW ----------------
-void startVotingForIndex(int idx) {
-  voting = true;
-  voterIndex = idx;
-  voteStartMs = millis();
-  voteTaken = false;
-  showLCD("VOTE NOW", "SELECT PARTY");
-}
-
-// *************** MODIFIED FUNCTION ***************
-void recordVoteAndPersist(char party, const char *partyName) {
-
-  voting = false;
-  voteTaken = true;
-
-  int ledPin = -1;
-
-  if (party == 'A') { countA++; ledPin = LED_A; }
-  else if (party == 'B') { countB++; ledPin = LED_B; }
-  else if (party == 'C') { countC++; ledPin = LED_C; }
-  else if (party == 'N') { countN++; ledPin = LED_N; }
-
-  if (ledPin != -1) digitalWrite(ledPin, HIGH);
-
-  votedFlags[voterIndex] = true;
-  eepromSaveAll();
-
-  showLCD("VOTED FOR", partyName);
-
-  tone(BUZZER, 1000, 300);   // buzzer beep
-  delay(300);
-
-  while (digitalRead(BTN_A) == LOW || digitalRead(BTN_B) == LOW ||
-         digitalRead(BTN_C) == LOW || digitalRead(BTN_N) == LOW);
-
-  if (ledPin != -1) digitalWrite(ledPin, LOW);
-
-  delay(1500);
-  showLCD("SCAN QR CODE", "");
-  voterIndex = -1;
-}
-
-// ---------------- SETUP ----------------
-void setup() {
-  Serial.begin(9600);
-  delay(200);
-
-  lcd.begin(16,2);
-
-  // LED + BUZZER setup
   pinMode(LED_A, OUTPUT);
   pinMode(LED_B, OUTPUT);
   pinMode(LED_C, OUTPUT);
   pinMode(LED_N, OUTPUT);
+
   pinMode(BUZZER, OUTPUT);
 
-  setupButtons();
-  eepromLoadAll();
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
 
-  showLCD("E-VOTING SYS", "SCAN QR CODE");
+  initEEPROM();
+
+  lcd.setCursor(0,0);
+  lcd.print("E-VOTING SYS");
+  lcd.setCursor(0,1);
+  lcd.print("SCAN QR CODE");
 }
 
 // ---------------- LOOP ----------------
 void loop() {
 
-  if (!voting && Serial.available()) {
+  // ---- Receive QR data from Python ----
+  if (!votingEnabled && Serial.available()) {
     String data = Serial.readStringUntil('\n');
+    data.trim();
+
     int idP = data.indexOf("VID:");
     int nmP = data.indexOf("NAME:");
+
     if (idP != -1 && nmP != -1) {
       String id = data.substring(idP + 4, data.indexOf(";", idP));
-      String nm = data.substring(nmP + 5);
-      int idx = findVoterIndex(id.c_str(), nm.c_str());
-      if (idx >= 0 && !votedFlags[idx]) startVotingForIndex(idx);
-      else showLCD("ALREADY VOTED", "");
+      String name = data.substring(nmP + 5);
+
+      int idx = findVoter(id.c_str(), name.c_str());
+
+      if (idx == -1) {
+        showMessage("INVALID VOTER", "");
+      }
+      else if (EEPROM.read(EEPROM_VOTED_START + idx) == 1) {
+        showMessage("ALREADY VOTED", "");
+      }
+      else {
+        activeVoter = idx;
+        votingEnabled = true;
+        showMessage("VOTE NOW", "SELECT PARTY");
+      }
     }
   }
 
-  if (voting && !voteTaken) {
-    updateButton(btnA);
-    updateButton(btnB);
-    updateButton(btnC);
-    updateButton(btnN);
-
-    if (btnA.lastState == LOW) recordVoteAndPersist('A', "PARTY A");
-    else if (btnB.lastState == LOW) recordVoteAndPersist('B', "PARTY B");
-    else if (btnC.lastState == LOW) recordVoteAndPersist('C', "PARTY C");
-    else if (btnN.lastState == LOW) recordVoteAndPersist('N', "NOTA");
+  // ---- Voting ----
+  if (votingEnabled) {
+    if (digitalRead(BTN_A) == LOW) castVote("PARTY A", LED_A);
+    else if (digitalRead(BTN_B) == LOW) castVote("PARTY B", LED_B);
+    else if (digitalRead(BTN_C) == LOW) castVote("PARTY C", LED_C);
+    else if (digitalRead(BTN_N) == LOW) castVote("NOTA", LED_N);
   }
+}
+
+// ---------------- FUNCTIONS ----------------
+
+void castVote(const char* party, int ledPin) {
+
+  // Mark voter as voted
+  EEPROM.update(EEPROM_VOTED_START + activeVoter, 1);
+
+  // ---------------- COUNT VOTES (NEW) ----------------
+  if (strcmp(party, "PARTY A") == 0) countA++;
+  else if (strcmp(party, "PARTY B") == 0) countB++;
+  else if (strcmp(party, "PARTY C") == 0) countC++;
+  else countN++;
+
+  // ---------------- SEND RESULT TO PC (NEW) ----------------
+  Serial.print("RESULT:A=");
+  Serial.print(countA);
+  Serial.print(",B=");
+  Serial.print(countB);
+  Serial.print(",C=");
+  Serial.print(countC);
+  Serial.print(",N=");
+  Serial.println(countN);
+
+  // ---------------- UI FEEDBACK ----------------
+  digitalWrite(ledPin, HIGH);
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("VOTED FOR");
+  lcd.setCursor(0,1);
+  lcd.print(party);
+
+  tone(BUZZER, 1000, 300);
+  delay(300);
+
+  while (
+    digitalRead(BTN_A) == LOW ||
+    digitalRead(BTN_B) == LOW ||
+    digitalRead(BTN_C) == LOW ||
+    digitalRead(BTN_N) == LOW
+  );
+
+  digitalWrite(ledPin, LOW);
+  delay(1500);
+
+  votingEnabled = false;
+  activeVoter = -1;
+
+  showMessage("E-VOTING SYS", "SCAN QR CODE");
+}
+
+// ---------------- FIND VOTER ----------------
+int findVoter(const char* id, const char* name) {
+  for (int i = 0; i < NUM_VOTERS; i++) {
+    if (strcmp(voterID[i], id) == 0 &&
+        strcmp(voterName[i], name) == 0)
+      return i;
+  }
+  return -1;
+}
+
+// ---------------- EEPROM INIT ----------------
+void initEEPROM() {
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC) {
+    EEPROM.update(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
+    for (int i = 0; i < NUM_VOTERS; i++) {
+      EEPROM.update(EEPROM_VOTED_START + i, 0);
+    }
+  }
+}
+
+// ---------------- LCD MESSAGE ----------------
+void showMessage(const char* l1, const char* l2) {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print(l1);
+  lcd.setCursor(0,1);
+  lcd.print(l2);
+  delay(1500);
 }
